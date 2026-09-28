@@ -253,8 +253,12 @@ reload();
 
 // ----- HTML Transform -----
 
+// Without `html`, the host also reads the renderer template
 globalThis.__transform_html__ = async function (html) {
   html = await rpc("transformHTML", html).catch((error) => {
+    if (html === undefined) {
+      throw error;
+    }
     console.warn("Failed to transform HTML via Vite:", error);
     return html;
   });

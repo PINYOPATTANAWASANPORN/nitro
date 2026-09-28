@@ -3,6 +3,7 @@ import type { DevEnvironment, DevEnvironmentContext, ResolvedConfig, ViteDevServ
 import type { FetchFunctionOptions, FetchResult } from "vite/module-runner";
 import type { RunnerRPCHooks, UpgradeContext } from "env-runner";
 
+import { readFile } from "node:fs/promises";
 import { IncomingMessage, ServerResponse } from "node:http";
 import { NodeRequest, sendNodeResponse } from "srvx/node";
 import { createViteHotChannel } from "env-runner/vite";
@@ -12,6 +13,8 @@ import { withBase, withoutBase } from "ufo";
 import { scanHandlers } from "../../scan.ts";
 import { onWatchError } from "../../utils/watch.ts";
 import { importVite, _resolveFromPath, type ViteImportOptions } from "./_import.ts";
+import { hasDevServerExports, reloadEnvRunner } from "./env.ts";
+import { buildDevServerExports } from "./_dev-exports.ts";
 
 // https://vite.dev/guide/api-environment-runtimes.html#modulerunner
 
@@ -174,6 +177,32 @@ export async function configureViteDevServer(ctx: NitroPluginContext, server: Vi
   const nitro = ctx.nitro!;
   const nitroEnv = server.environments.nitro as FetchableDevEnvironment;
 
+  const reloadExports = async () => {
+    try {
+      const code = await buildDevServerExports(ctx, nitroEnv);
+      if (code !== ctx._serverEntryExports) {
+        ctx._serverEntryExports = code;
+        await reloadEnvRunner(ctx);
+      }
+    } catch (error) {
+      nitro.logger.error(error);
+    } finally {
+      server.watcher.add([...(ctx._serverEntryExportFiles || [])]);
+    }
+  };
+  if (hasDevServerExports(ctx)) {
+    const debouncedReloadExports = debounce(reloadExports);
+    server.watcher.on("all", (event, file) => {
+      if (
+        (event === "change" || event === "add" || event === "unlink") &&
+        ctx._serverEntryExportFiles?.has(normalize(file))
+      ) {
+        debouncedReloadExports();
+      }
+    });
+    await reloadExports();
+  }
+
   const viteBase = server.config.base || "/";
 
   // Restart with nitro.config changes
@@ -183,7 +212,11 @@ export async function configureViteDevServer(ctx: NitroPluginContext, server: Vi
   }
 
   // Websocket (`httpServer` is null in middleware mode, the parent server handles upgrades)
-  if (nitro.options.features.websocket ?? nitro.options.experimental.websocket) {
+  // Server entry exports (e.g. Durable Objects) can accept upgrades from routes without crossws
+  if (
+    (nitro.options.features.websocket ?? nitro.options.experimental.websocket) ||
+    hasDevServerExports(ctx)
+  ) {
     server.httpServer?.on("upgrade", (req, socket, head) => {
       const protocol = req.headers["sec-websocket-protocol"];
       if (protocol?.startsWith("vite-")) {
@@ -250,8 +283,11 @@ export async function configureViteDevServer(ctx: NitroPluginContext, server: Vi
   nitroEnv.devServer.onMessage(async (message: any) => {
     if (message?.__rpc === "transformHTML") {
       try {
-        const htmlURL = _htmlTemplateURL(nitro.options.renderer?.template, server.config.root);
-        const html = (await server.transformIndexHtml(htmlURL, message.data)).replace(
+        const template = nitro.options.renderer?.template;
+        const htmlURL = _htmlTemplateURL(template, server.config.root);
+        // The worker omits the HTML when it has no host file system access (e.g. workerd)
+        const rawHTML = message.data ?? (await readFile(template!, "utf8"));
+        const html = (await server.transformIndexHtml(htmlURL, rawHTML)).replace(
           "<!--ssr-outlet-->",
           `{{{ globalThis.__nitro_vite_envs__?.["ssr"]?.fetch($REQUEST) || "" }}}`
         );
